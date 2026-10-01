@@ -1,7 +1,5 @@
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
@@ -10,8 +8,26 @@ import java.nio.file.Paths;
 import java.util.zip.GZIPOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 
 public class Main {
+
+    public static final ConcurrentHashMap<String, Piperoom> activerooms = new ConcurrentHashMap<>();
+    
+    public static class Piperoom {
+        public java.util.concurrent.LinkedBlockingQueue<byte[]> queue;
+        public CountDownLatch latch;
+        public long fileSize = 0;
+        public String fileName = "GhostBridge_Transfer.zip"; // Default fallback
+        public volatile boolean isFinished = false;
+
+        public Piperoom() {
+            this.queue = new java.util.concurrent.LinkedBlockingQueue<>(2000); 
+            this.latch = new CountDownLatch(2);
+        }
+    }
+
     public static void main(String[] args) {
         System.out.println("Logs from your program will appear here!");
         
@@ -37,30 +53,48 @@ public class Main {
 
     public static void handleClient(Socket socket, String directory) {
         try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            java.io.InputStream rawInput = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
             
-            String requestLine;
-            
-            while ((requestLine = in.readLine()) != null) {
-                if (requestLine.isEmpty()) continue;
+            while (true) {
+                StringBuilder headerText = new StringBuilder();
+                int b;
                 
-                String[] requestParts = requestLine.split(" ");
-                if (requestParts.length < 2) continue;
+                while ((b = rawInput.read()) != -1) {
+                    headerText.append((char) b);
+                    if (headerText.toString().endsWith("\r\n\r\n")) {
+                        break;
+                    }
+                }
                 
-                String method = requestParts[0]; 
+                if (headerText.length() == 0) {
+                    break;
+                }
+                
+                String[] headerLines = headerText.toString().split("\r\n");
+                if (headerLines.length == 0 || headerLines[0].isEmpty()) return;
+
+                String[] requestParts = headerLines[0].split(" ");
+                if (requestParts.length < 2) return;
+
+                String method = requestParts[0];
                 String path = requestParts[1];
-                
-                // 1. GLOBAL HEADER PARSER: Read all headers before routing
-                String headerLine;
+
                 boolean closeConnection = false;
                 String acceptedEncodings = "";
                 String userAgent = null;
-                int contentLength = 0;
+                long contentLength = 0;
                 
-                while ((headerLine = in.readLine()) != null && !headerLine.isEmpty()) {
-                    String lowerHeader = headerLine.toLowerCase();
+                long totalFileSize = 0; 
+                boolean isFirstChunk = false; 
+                boolean isLastChunk = false; 
+                String originalFileName = null;
+                
+                for (int i = 1; i < headerLines.length; i++) {
+                    String headerLine = headerLines[i];
+                    if (headerLine.isEmpty()) continue;
                     
+                    String lowerHeader = headerLine.toLowerCase();
                     if (lowerHeader.startsWith("connection:") && lowerHeader.contains("close")) {
                         closeConnection = true;
                     } else if (lowerHeader.startsWith("accept-encoding:")) {
@@ -68,17 +102,31 @@ public class Main {
                     } else if (lowerHeader.startsWith("user-agent:")) {
                         userAgent = headerLine.substring(11).trim();
                     } else if (lowerHeader.startsWith("content-length:")) {
-                        contentLength = Integer.parseInt(headerLine.substring(15).trim());
+                        contentLength = Long.parseLong(headerLine.substring(15).trim());
+                    } else if (lowerHeader.startsWith("x-file-size:")) {
+                        totalFileSize = Long.parseLong(headerLine.substring(12).trim());
+                        isFirstChunk = true;
+                    } else if (lowerHeader.startsWith("x-last-chunk:")) {
+                        isLastChunk = headerLine.substring(13).trim().equals("true");
+                    } else if (lowerHeader.startsWith("x-file-name:")) {
+                        originalFileName = java.net.URLDecoder.decode(headerLine.substring(12).trim(), StandardCharsets.UTF_8);
                     }
                 }
                 
-                // Prepare the connection header to append to all responses
                 String connHeader = closeConnection ? "Connection: close\r\n" : "";
 
-                // 2. CLEAN ROUTING
                 if (path.equals("/")) {
-                    String responseBody = "Hello, World!";
-                    out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" + connHeader + "Content-Length: " + responseBody.length() + "\r\n\r\n" + responseBody).getBytes());
+                    try {
+                        java.io.File file = new java.io.File("index.html");
+                        byte[] fileBytes = java.nio.file.Files.readAllBytes(file.toPath());
+
+                        String responseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" + connHeader + "Content-Length: " + fileBytes.length + "\r\n\r\n";
+                        out.write(responseHeaders.getBytes());
+                        out.write(fileBytes);
+                    } catch (IOException e) {
+                        String errorMsg = "HTTP/1.1 500 Internal Server Error\r\n" + connHeader + "\r\n";
+                        out.write(errorMsg.getBytes());
+                    }
                 } 
                 else if (path.startsWith("/echo/")) {
                     String body = path.substring(6);
@@ -114,6 +162,65 @@ public class Main {
                     out.write(responseHeaders.getBytes());
                     out.write(responseBytes);
                 } 
+                else if (path.startsWith("/pipe/")) {
+                    String roomCode = path.substring(6);
+                    Piperoom room = activerooms.computeIfAbsent(roomCode, k -> new Piperoom());
+                    
+                    try {
+                        if (method.equals("POST")) {
+                            if (isFirstChunk) {
+                                room.fileSize = totalFileSize;
+                                if (originalFileName != null) room.fileName = originalFileName;
+                                room.latch.countDown();
+                            }
+                            
+                            room.latch.await();
+
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            long totalBytesRead = 0;
+                                
+                            while (totalBytesRead < contentLength && (bytesRead = rawInput.read(buffer, 0, (int)Math.min(buffer.length, contentLength - totalBytesRead))) != -1) {
+                                room.queue.put(java.util.Arrays.copyOf(buffer, bytesRead));
+                                totalBytesRead += bytesRead;
+                            }
+
+                            if (isLastChunk) {
+                                room.isFinished = true;
+                            }
+
+                            String response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                            out.write(response.getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                        }
+                        else if (method.equals("GET")) {
+                            room.latch.countDown();
+                            room.latch.await();
+
+                            String responseHeaders = "HTTP/1.1 200 OK\r\n" + 
+                                                     "Content-Type: application/octet-stream\r\n" +
+                                                     "Content-Disposition: attachment; filename=\"" + room.fileName + "\"\r\n" +
+                                                     "Content-Length: " + room.fileSize + "\r\n\r\n";
+                            out.write(responseHeaders.getBytes());
+                            out.flush();
+                            System.out.println("Starting download! File: " + room.fileName + " | Size: " + room.fileSize);
+                            
+                            while (true) {
+                                byte[] data = room.queue.poll(1, java.util.concurrent.TimeUnit.SECONDS);
+                                if (data != null) {
+                                    out.write(data);
+                                    out.flush();
+                                } else if (room.isFinished && room.queue.isEmpty()) {
+                                    break; 
+                                }
+                            }
+                            activerooms.remove(roomCode);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        out.write("HTTP/1.1 500 Internal Server Error\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+                    }
+                }
                 else if (path.startsWith("/user-agent")) {
                     if (userAgent != null) {
                         out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" + connHeader + "Content-Length: " + userAgent.length() + "\r\n\r\n" + userAgent).getBytes());
@@ -136,16 +243,16 @@ public class Main {
                         }
                     } 
                     else if (method.equals("POST")) {
-                        char[] bodyChars = new char[contentLength];
-                        int charactersRead = 0;
-                        while (charactersRead < contentLength) {
-                            int read = in.read(bodyChars, charactersRead, contentLength - charactersRead);
-                            if (read == -1) break;
-                            charactersRead += read;
-                        }
+                        long totalBytesRead = 0;
+                        byte[] buffer = new byte[8192];
+                        int bytesRead;
                         
-                        String body = new String(bodyChars, 0, charactersRead);
-                        Files.write(filepath, body.getBytes());
+                        try (java.io.FileOutputStream fileStream = new java.io.FileOutputStream(filepath.toFile())) {
+                            while (totalBytesRead < contentLength && (bytesRead = rawInput.read(buffer, 0, (int)Math.min(buffer.length, contentLength - totalBytesRead))) != -1) {
+                                fileStream.write(buffer, 0, bytesRead);
+                                totalBytesRead += bytesRead;
+                            }
+                        }
                         
                         String responseHeaders = "HTTP/1.1 201 Created\r\n" + connHeader + "\r\n";
                         out.write(responseHeaders.getBytes());
@@ -157,8 +264,6 @@ public class Main {
                 
                 out.flush();
                 
-                // 3. THE HANG UP
-                // If the client requested closure, break out of the while loop to close the socket
                 if (closeConnection) {
                     break;
                 }

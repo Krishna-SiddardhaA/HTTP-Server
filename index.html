@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GhostBridge | P2P Transfer</title>
+    <style>
+        :root {
+            --bg-color: #1a1a1a;
+            --card-bg: #2d2d2d;
+            --text-main: #f4f4f5;
+            --text-muted: #a1a1aa;
+            --accent-green: #789076;
+            --accent-hover: #5e735d;
+            --border-color: #3f3f46;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 3rem;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin: 0;
+            letter-spacing: 2px;
+            color: var(--accent-green);
+        }
+
+        .header p {
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+        }
+
+        .container {
+            display: flex;
+            gap: 2rem;
+            flex-wrap: wrap;
+            justify-content: center;
+            max-width: 900px;
+            width: 90%;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 2rem;
+            flex: 1;
+            min-width: 300px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+        }
+
+        .card h2 {
+            margin-top: 0;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 0.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+            display: flex;
+            flex-direction: column;
+        }
+
+        label {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+        }
+
+        input[type="text"], input[type="file"] {
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 1rem;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: var(--accent-green);
+        }
+
+        button {
+            background-color: var(--accent-green);
+            color: white;
+            border: none;
+            padding: 1rem;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            width: 100%;
+        }
+
+        button:hover {
+            background-color: var(--accent-hover);
+        }
+
+        .status {
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            text-align: center;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>GHOSTBRIDGE</h1>
+        <p>Zero-Storage P2P File Streaming</p>
+    </div>
+
+    <div class="container">
+        <!-- SENDER UI -->
+        <div class="card">
+            <h2>Send File</h2>
+            <div class="form-group">
+                <label for="sendRoomCode">Create Room Code</label>
+                <input type="text" id="sendRoomCode" placeholder="e.g., gta5-transfer" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="fileInput">Select File</label>
+                <input type="file" id="fileInput">
+            </div>
+            <button onclick="uploadFile()">Stream to Receiver</button>
+            <div id="sendStatus" class="status"></div>
+        </div>
+
+        <!-- RECEIVER UI -->
+        <div class="card">
+            <h2>Receive File</h2>
+            <div class="form-group">
+                <label for="receiveRoomCode">Enter Room Code</label>
+                <input type="text" id="receiveRoomCode" placeholder="e.g., gta5-transfer" autocomplete="off">
+            </div>
+            <button onclick="downloadFile()">Connect & Download</button>
+            <div id="receiveStatus" class="status"></div>
+        </div>
+    </div>
+
+    <script>
+        // Upload Logic
+        async function uploadFile() {
+            const roomCode = document.getElementById('sendRoomCode').value.trim();
+            const fileInput = document.getElementById('fileInput');
+            const statusText = document.getElementById('sendStatus');
+
+            if (!roomCode || fileInput.files.length === 0) {
+                statusText.style.color = '#ff6b6b';
+                statusText.innerText = "Please enter a Room Code and select a file.";
+                return;
+            }
+
+            const file = fileInput.files[0];
+            statusText.style.color = 'var(--text-muted)';
+            statusText.innerText = "Waiting for receiver to join... (Do not close tab)";
+
+            const chunkSize = 50 * 1024 * 1024; // 50MB per slice
+            const totalChunks = Math.ceil(file.size / chunkSize);
+
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * chunkSize;
+                const end = Math.min(start + chunkSize, file.size);
+                const chunk = file.slice(start, end);
+                
+                const headers = {};
+                if (i === 0) {
+                    headers['X-File-Size'] = file.size.toString();
+                    headers['X-File-Name'] = encodeURIComponent(file.name); 
+                }
+                if (i === totalChunks - 1) headers['X-Last-Chunk'] = 'true';
+
+                try {
+                    const response = await fetch('/pipe/' + roomCode, {
+                        method: 'POST',
+                        body: chunk,
+                        headers: headers
+                    });
+
+                    if (!response.ok) throw new Error('Server returned ' + response.status);
+                    
+                    if (i > 0) {
+                        statusText.style.color = 'var(--accent-green)';
+                        statusText.innerText = `Streaming chunk ${i + 1} of ${totalChunks}...`;
+                    }
+                } catch (error) {
+                    statusText.style.color = '#ff6b6b';
+                    statusText.innerText = "Connection lost at chunk " + (i + 1);
+                    return;
+                }
+            }
+
+            statusText.style.color = 'var(--accent-green)';
+            statusText.innerText = "Transfer completed successfully!";
+        }
+
+        // Download Logic
+        function downloadFile() {
+            const roomCode = document.getElementById('receiveRoomCode').value.trim();
+            const statusText = document.getElementById('receiveStatus');
+
+            if (!roomCode) {
+                statusText.style.color = '#ff6b6b';
+                statusText.innerText = "Please enter a Room Code.";
+                return;
+            }
+
+            statusText.style.color = 'var(--text-muted)';
+            statusText.innerText = "Connecting to sender...";
+
+            window.location.href = '/pipe/' + roomCode;
+            
+            setTimeout(() => {
+                statusText.style.color = 'var(--accent-green)';
+                statusText.innerText = "Download started! Check your browser downloads.";
+            }, 2000);
+        }
+    </script>
+</body>
+</html>
